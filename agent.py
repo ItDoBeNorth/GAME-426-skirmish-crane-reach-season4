@@ -33,12 +33,22 @@ THREAT_MEMORY_ROUNDS = 2
 ALLY_MEMORY_ROUNDS = 2
 # A tile is "tankable" when expected incoming damage < HP * fraction. Starting values, untuned:
 # archers keep a wide margin (fragile, they kite), melee only needs to survive.
-TANK_FRACTION = {"archer": 0.5, "footman": 1.0, "cavalry": 1.0}
-# One type order for both attacking and protecting (user spec): archer > footman > cavalry.
-TYPE_RANK = {"archer": 3, "footman": 2, "cavalry": 1}
-# Formation (user spec): archers at the back, footmen wall 1 tile in front of them, cavalry the
-# front line 3 tiles in front. Tiles measured from the nearest allied archer toward the enemy.
-FORMATION_DEPTH = {"footman": 1, "cavalry": 3, "archer": 0}
+# S4: cavalry (10 HP, the striker) keeps a margin too; footmen (12 HP + shield wall) are the tanks.
+TANK_FRACTION = {"archer": 0.5, "footman": 1.0, "cavalry": 0.7}
+# One type order for both attacking and protecting (user spec, S4): archer > cavalry > footman.
+TYPE_RANK = {"archer": 3, "cavalry": 2, "footman": 1}
+# Grouping order (S4 task 7): which ally to group with. Footmen before cavalry, so roaming cavalry
+# do not pull footmen out of the wall.
+GROUP_RANK = {"archer": 3, "footman": 2, "cavalry": 1}
+# Cavalry hit-and-run (S4 task 7): a tile this many tiles (or one more) from an enemy lets the next
+# activation charge it (the walk to an adjacent tile is then at least 3 tiles).
+CHARGE_SETUP_DISTANCE = 4
+# Formation (user spec, S4): archers at the back, cavalry in reserve 1 tile in front of them, and
+# the footman wall in front of both. Tiles measured from the nearest allied archer toward the enemy.
+# (S3 had cavalry as the front line 3 tiles in front and footmen 1 tile in front.)
+FORMATION_DEPTH = {"footman": 2, "cavalry": 1, "archer": 0}
+# Footman wall (S4): footmen fill the ring this many tiles around our archer, on the enemy's side.
+WALL_RADIUS = 2
 # Allies farther than this do not block our route planning (the action mask still decides legality).
 ALLY_BLOCK_RADIUS = 2
 # Activations on the same tile, while trying to get somewhere, before we count as stuck.
@@ -184,11 +194,11 @@ class Agent:
     def _prepare_report(self, observation: SkirmishObservation) -> None:
         """Build the outgoing text and pick its recipients (user spec).
 
-        Content priority: enemies attacking me > other enemies I see (archer > footman > cavalry,
+        Content priority: enemies attacking me > other enemies I see (archer > cavalry > footman,
         nearest first) > me. Format "R<round>|A <code>.<q>.<r>.<hp> ...|S ...|M ...", where a code is
         a type letter plus roster index (enemy "c2" = <enemy side>_cavalry_2), cut to 200 chars.
         Recipient priority (visible allies only): allies that cannot see a reported enemy > allies
-        that just came into view > allies not messaged yet, each group archer > footman > cavalry;
+        that just came into view > allies not messaged yet, each group archer > cavalry > footman;
         at most CHAT_RECIPIENTS per activation.
         """
         here = me.position(observation)
@@ -336,7 +346,7 @@ class Agent:
         return None
 
     def _fresh_alert(self) -> Position | None:
-        """Nearest-priority ally that recently reported being attacked (archer > footman > cavalry)."""
+        """Nearest-priority ally that recently reported being attacked (archer > cavalry > footman)."""
         alerts = [
             alert
             for unit_id, alert in self._ally_alerts.items()
@@ -476,6 +486,12 @@ class Agent:
         # Hill and across-water enemies stay in `enemies` (still threats) but are not engaged.
         engageable = [enemy for enemy in enemies if self._melee_can_engage(observation, enemy, ally_archers)]
         adjacent = [enemy for enemy in engageable if self._distance(me.position(observation), enemy["position"]) <= attack_range]
+        if adjacent and unit_type == "cavalry":
+            # S4 task 7: cavalry next to an enemy weighs every enemy it can reach this turn, since a
+            # charge on another one (5) beats a standing hit (3); _cavalry_choice may also ride off
+            # to set up the next charge (hit-and-run).
+            target = self._select_target(observation, paths, engageable)
+            return self._attack_or_flee(observation, paths, self._attack_paths(paths, target, unit_type), target, enemies)
         if adjacent:
             target = self._select_target(observation, paths, adjacent)
             stay = next(option for option in paths if option[0] == 0)
@@ -500,14 +516,16 @@ class Agent:
         if archer_threats and unit_type == "footman" and self._can_tank(observation, here):
             archer_threats = []
         if archer_threats:
-            opportunistic = self._select_target(observation, paths, [enemy for enemy in engageable if enemy["type"] in {"cavalry", "footman"}])
+            # S4 task 7: cavalry may also strike the archers themselves (its target order puts them first).
+            hittable = engageable if unit_type == "cavalry" else [enemy for enemy in engageable if enemy["type"] in {"cavalry", "footman"}]
+            opportunistic = self._select_target(observation, paths, hittable)
             if opportunistic is not None:
                 attack_paths = self._attack_paths(paths, opportunistic, unit_type)
                 if attack_paths:
                     return self._attack_or_flee(observation, paths, attack_paths, opportunistic, enemies)
             return self._archer_response(observation, paths, archer_threats)
 
-        # Target order: one-hit kill > attackable now > archer > footman > cavalry (see _target_utility).
+        # Target order: one-hit kill > attackable now > archer > cavalry > footman (see _target_utility).
         target = self._select_target(observation, paths, engageable)
         if target is not None:
             attack_paths = self._attack_paths(paths, target, unit_type)
@@ -526,7 +544,7 @@ class Agent:
     ) -> int:
         """Where melee walks when it has no strike this turn. Move order (user spec):
         enemies attacking allies > shield wall > allies > enemies > center.
-        Protect priority is archer > footman > cavalry (_threatened_allies order).
+        Protect priority is archer > cavalry > footman (_threatened_allies order).
         """
         here = me.position(observation)
         own_type = me.unit_type(observation)
@@ -542,13 +560,30 @@ class Agent:
                 goal = self._screen_tile(ally["position"], enemy["position"])
             else:
                 goal = self._copy(ally["position"])
-            return self._toward(observation, paths, goal)
+            # S4 task 5a: a route that makes no progress (goal across water, boxed in) used to
+            # mean standing still, often under fire; fall through to the next rule instead.
+            path = self._toward(observation, paths, goal)
+            if path != 0 or self._distance(here, goal) <= 1:
+                return path
         alert = self._fresh_alert()
         if alert is not None:
             # An ally out of our sight reported "enemy attacking me" by chat: go help.
-            return self._toward(observation, paths, alert)
+            path = self._toward(observation, paths, alert)
+            if path != 0 or self._distance(here, alert) <= 1:
+                return path
+        if own_type == "cavalry":
+            # S4 task 7: cavalry is the offense: with no strike this turn it hunts enemy archers
+            # (staging for a charge) before taking its reserve slot behind the wall.
+            hunt = self._cavalry_hunt(observation, paths)
+            if hunt is not None:
+                return hunt
 
-        if own_type == "footman" and enemies:
+        group = self._protect_goal(observation, allies)
+        front = self._front_point(observation)
+        # Footman wall (S4 task 4): with an allied archer to wall around, footmen take ring slots in
+        # front of it (below). Without one, they fall back to pairing up with the nearest footman.
+        walling = own_type == "footman" and group is not None and front is not None and bool(ally_archers)
+        if own_type == "footman" and enemies and not walling:
             # Only nearby footmen (within 4), so the wall forms locally instead of across the map.
             partners = [ally for ally in allies if ally["type"] == "footman" and self._distance(here, ally["position"]) <= 4]
             if partners and not any(self._distance(here, ally["position"]) == 1 for ally in partners):
@@ -562,16 +597,22 @@ class Agent:
             return self._toward(observation, paths, bigger)
 
         # Allies step, as a formation: with an allied archer to anchor on and a known enemy front,
-        # cavalry holds the front line 3 tiles ahead of the archer and footmen wall 1 tile ahead.
+        # footmen take their wall slot on the ring in front of the archer (S4) and cavalry waits in
+        # reserve 1 tile ahead of the archer, behind the wall.
+        # (S3: cavalry held the front line 3 tiles ahead and footmen walled 1 tile ahead.)
         # Without that, just regroup with the nearest ally (archer first) when beyond our MP radius.
-        group = self._protect_goal(observation, allies)
-        front = self._front_point(observation)
         anchor = group
         if group is not None and front is not None and ally_archers:
             archer = min(ally_archers, key=lambda position: self._distance(here, position))
-            anchor = self._formation_slot(archer, front, FORMATION_DEPTH[own_type])
-            if self._distance(here, anchor) > 1:
-                return self._toward(observation, paths, anchor)
+            if walling:
+                # Footmen stand exactly on their slot, so neighbouring slots make a shield wall.
+                anchor = self._wall_slot(archer, front)
+                if self._distance(here, anchor) > 0:
+                    return self._toward(observation, paths, anchor)
+            else:
+                anchor = self._formation_slot(archer, front, FORMATION_DEPTH[own_type])
+                if self._distance(here, anchor) > 1:
+                    return self._toward(observation, paths, anchor)
         elif group is not None and self._distance(here, group) > mp:
             return self._toward(observation, paths, group)
 
@@ -642,6 +683,44 @@ class Agent:
         )
         return {"q": best[0], "r": best[1]}
 
+    def _wall_slot(self, archer: AxialPosition, front: AxialPosition) -> Position:
+        """Footman wall (S4 task 4): a free tile on the ring WALL_RADIUS around our archer, on the
+        enemy front's side. Ring tiles touch, so footmen side by side on it are in shield wall.
+
+        The ring fills from the tile nearest the front outward. A footman already on the ring next
+        to another footman keeps its tile, so the line does not reshuffle. Marsh, water, blocked
+        tiles and tiles across water from the archer are skipped, so the wall bends along a bank.
+        """
+        archer_key, front_key, here = self._key(archer), self._key(front), self._key(self._here)
+        depth = self._key_distance(archer_key, front_key)
+        ring = [
+            spot
+            for spot, cost in self._cost_grid.items()
+            if cost is not None
+            and self._key_distance(spot, archer_key) == WALL_RADIUS
+            and self._key_distance(spot, front_key) < depth
+            and spot not in self._marsh
+            and not self._water_between(archer, {"q": spot[0], "r": spot[1]})
+        ]
+        footmen = {self._key(ally["position"]) for ally in self._allies_now if ally["type"] == "footman"}
+        if here in ring and any(spot in footmen for spot in self._neighbor_keys(here)):
+            return self._copy(self._here)
+        free = [spot for spot in ring if spot not in self._blocked or spot == here]
+        if not free:
+            return self._formation_slot(archer, front, FORMATION_DEPTH["footman"])
+        # S4 task 5c: join the line: a free tile beside a footman already on the ring comes first, so a
+        # lone footman does not hold an isolated slot in the open.
+        walled = {spot for spot in ring if spot in footmen}
+
+        def joins(spot: Key) -> bool:
+            return any(neighbor in walled for neighbor in self._neighbor_keys(spot))
+
+        best = min(
+            free,
+            key=lambda spot: (not joins(spot), self._key_distance(spot, front_key), self._key_distance(spot, here), self._tie_spot(spot)),
+        )
+        return {"q": best[0], "r": best[1]}
+
     def _behind_melee(self, paths: list[PathOption], allies: Iterable[VisibleUnit], front: AxialPosition) -> list[PathOption]:
         """Archer paths that stay at least a tile behind our most forward visible melee ally."""
         melee = [ally for ally in allies if ally["type"] in {"footman", "cavalry"}]
@@ -651,14 +730,17 @@ class Agent:
         return [option for option in paths if self._distance(option[1], front) >= lead + 1]
 
     def _protect_goal(self, observation: SkirmishObservation, allies: Iterable[VisibleUnit]) -> Position | None:
-        """Ally to group with: archer > footman > cavalry, nearest first; memory if none in sight."""
+        """Ally to group with: archer > footman > cavalry (GROUP_RANK, S4 task 7), nearest first;
+        memory if none in sight. Grouping keeps its own order so roaming cavalry do not pull
+        footmen out of the wall.
+        """
         here = me.position(observation)
         choices = [(ally["type"], ally["position"]) for ally in allies] or [
             (record["type"], record["position"]) for record in self._recent(self._ally_memory, ALLY_MEMORY_ROUNDS)
         ]
         if not choices:
             return None
-        best = min(choices, key=lambda choice: (-TYPE_RANK[choice[0]], self._distance(here, choice[1])))
+        best = min(choices, key=lambda choice: (-GROUP_RANK[choice[0]], self._distance(here, choice[1])))
         return self._copy(best[1])
 
     def _attack_or_flee(
@@ -697,6 +779,9 @@ class Agent:
         enemy able to reach us > flee if a safer tile exists > attack.
 
         Protecting any ally the target can strike skips the caution and attacks.
+        S4 task 7: a charge we can tank is taken (cavalry's strongest tool), and "flee" first tries a
+        tile CHARGE_SETUP_DISTANCE from the target, so the next activation can charge it again
+        (hit-and-run).
         """
         best = self._best_attack_path(observation, attack_paths, target)
         attack = self._order(best[0], target["unit_id"], observation)
@@ -707,15 +792,71 @@ class Agent:
         first_hit = self._expected_damage(observation, "cavalry", best[1], target, start=here)
         follow_up = self._expected_damage(observation, "cavalry", best[1], target)
         incoming = self._incoming(observation, best[1])
+        if first_hit > follow_up and self._can_tank(observation, best[1]):
+            return attack
         others_near = self._incoming(observation, best[1], exclude=target_key) > 0
         if incoming < me.hit_points(observation) and target["hit_points"] <= first_hit + follow_up and not others_near:
             return attack
+        setup = [
+            option
+            for option in paths
+            if CHARGE_SETUP_DISTANCE <= self._distance(option[1], target["position"]) <= CHARGE_SETUP_DISTANCE + 1
+        ]
+        if setup:
+            retreat = min(
+                setup,
+                key=lambda option: (
+                    self._incoming(observation, option[1]),
+                    -self._terrain_preference(observation, option[1]),
+                    self._tie(option[0]),
+                ),
+            )
+            if self._incoming(observation, retreat[1]) < incoming:
+                return self._order(retreat[0], None, observation)
         threats = [(enemy["type"], enemy["position"]) for enemy in enemies]
         flee_path = self._flee(observation, paths, threats)
         flee_end = next(end for path_id, end in paths if path_id == flee_path)
         if self._incoming(observation, flee_end) < incoming:
             return self._order(flee_path, None, observation)
         return attack
+
+    def _cavalry_hunt(self, observation: SkirmishObservation, paths: list[PathOption]) -> int | None:
+        """S4 task 7: with no strike this turn, ride toward the nearest known enemy archer (seen, or
+        remembered up to THREAT_MEMORY_ROUNDS; never one on a hill) and stop on a staging tile
+        CHARGE_SETUP_DISTANCE from it, so the next activation charges (5 damage, 6 downhill; an
+        archer has 6 HP). Only tiles we can tank; None when there is no archer or no such tile.
+        """
+        here = me.position(observation)
+        archers = [enemy for enemy in self._enemies_now if enemy["type"] == "archer"]
+        seen_ids = {enemy["unit_id"] for enemy in self._enemies_now}
+        archers += [
+            record
+            for unit_id, record in self._enemy_memory.items()
+            if record["type"] == "archer" and unit_id not in seen_ids and self._round - record["round"] <= THREAT_MEMORY_ROUNDS
+        ]
+        archers = [archer for archer in archers if tile.terrain_at(observation, archer["position"])["terrain"] != "hill"]
+        if not archers:
+            return None
+        target = min(archers, key=lambda archer: (self._distance(here, archer["position"]), self._tie_spot(self._key(archer["position"]))))
+        goal = target["position"]
+        safe = [
+            option
+            for option in paths
+            if self._distance(option[1], goal) >= CHARGE_SETUP_DISTANCE and self._can_tank(observation, option[1])
+        ]
+        if not safe:
+            return None
+        staging = [option for option in safe if self._distance(option[1], goal) <= CHARGE_SETUP_DISTANCE + 1]
+        if staging:
+            return min(
+                staging,
+                key=lambda option: (
+                    self._incoming(observation, option[1]),
+                    -self._terrain_preference(observation, option[1]),
+                    self._tie(option[0]),
+                ),
+            )[0]
+        return self._toward(observation, safe, goal)
 
     def _threat_sources(self, observation: SkirmishObservation) -> list[tuple[str, Key, float, bool]]:
         """Known enemies as (type, tile, weight, on_hill), cached per activation.
@@ -840,7 +981,7 @@ class Agent:
     def _threatened_allies(self) -> list[tuple[VisibleUnit, VisibleUnit]]:
         """(ally, enemy) pairs where a visible enemy can strike a visible ally next activation.
 
-        Ordered by protect priority archer > footman > cavalry, then the ally nearest to us.
+        Ordered by protect priority archer > cavalry > footman, then the ally nearest to us.
         """
         if self._threatened is not None:
             return self._threatened
@@ -882,9 +1023,14 @@ class Agent:
 
     def _melee_can_engage(self, observation: SkirmishObservation, enemy: VisibleUnit, ally_archers: list[Position]) -> bool:
         """Melee never picks an enemy on a hill (archers take it, or we wait for it to come down).
-        Enemies across water are left to archers too, unless we have no archers left."""
+        Enemies across water are left to archers too, unless we have no archers left.
+        S4 task 7: cavalry (4 MP) is exempt from the water rule; its routes go around through the
+        passages, and attack paths only hold tiles it can reach this turn.
+        """
         if tile.terrain_at(observation, enemy["position"])["terrain"] == "hill":
             return False
+        if me.unit_type(observation) == "cavalry":
+            return True
         return not (ally_archers and self._water_between(me.position(observation), enemy["position"]))
 
     def _ally_archer_positions(self, allies: Iterable[VisibleUnit]) -> list[Position]:
@@ -965,6 +1111,10 @@ class Agent:
             if attack_paths:
                 return self._order(self._best_attack_path(observation, attack_paths, target)[0], target["unit_id"], observation)
             return self._order(self._toward(observation, paths, target["position"]), None, observation)
+        # S4 task 7: no good trade now: stage for a charge on an archer if a tankable tile allows it.
+        hunt = self._cavalry_hunt(observation, paths)
+        if hunt is not None:
+            return self._order(hunt, None, observation)
         return self._order(self._flee(observation, safe_paths or paths, threats), None, observation)
 
     def _advance_with_visible_ally(
@@ -1123,14 +1273,25 @@ class Agent:
                 score -= 1
         return score
 
+    def _footman_covered(self, observation: SkirmishObservation, end: AxialPosition) -> bool:
+        """S4 task 5: a footman on `end` takes 1 less arrow damage: beside an allied footman (shield
+        wall, which also denies charge) or in forest (cover works against any attack from beyond
+        1 tile, so arrows, even with a melee enemy adjacent).
+        """
+        if any(ally["type"] == "footman" and self._distance(end, ally["position"]) == 1 for ally in self._allies_now):
+            return True
+        return tile.terrain_at(observation, end)["feature"] == "forest"
+
     def _best_attack_path(self, observation: SkirmishObservation, attack_paths: Iterable[PathOption], target: VisibleUnit) -> PathOption:
-        """Strike from the tile that hits hardest (charge, high ground), then by terrain preference."""
+        """Strike from the tile that hits hardest (charge, high ground), then (footmen, S4 task 5)
+        a covered tile, then by terrain preference."""
         here = me.position(observation)
         own_type = me.unit_type(observation)
         return max(
             attack_paths,
             key=lambda option: (
                 self._expected_damage(observation, own_type, option[1], target, start=here),
+                own_type == "footman" and self._footman_covered(observation, option[1]),
                 self._terrain_preference(observation, option[1]),
                 -self._distance(option[1], target["position"]),
                 -self._tie(option[0]),
@@ -1139,11 +1300,16 @@ class Agent:
 
     def _target_utility(self, observation: SkirmishObservation, paths: list[PathOption], enemy: VisibleUnit) -> tuple:
         """Target order (user spec): one-hit kill > attackable this turn > focus fire > archer >
-        footman > cavalry, nearer on ties. Replaces the Season 2 weighted score; counter-attack risk
+        cavalry > footman (S4 order), nearer on ties. Replaces the Season 2 weighted score; counter-attack risk
         is no longer scored here, the attack/flee rules (_incoming, with travel-aware charge) handle it.
 
         Focus fire (G5): an enemy already being attacked (hurt, or next to one of our units) is
         preferred, so everyone who can see it piles onto the same one.
+
+        Archers (S4 task 5b) rank damage per arrow right after "attackable": against Banner 61% of our
+        arrows hit shield-walled footmen for ~1.2 damage, while archers and cavalry took ~2.1.
+        Cavalry (S4 task 7) ranks enemy archers first, then the hardest strike (charge counts), so it
+        hunts the units that deal ~75% of all damage and skips charge-proof targets unless killable.
         """
         own_type = me.unit_type(observation)
         own_range = units.STATS[own_type].attack_range
@@ -1158,7 +1324,13 @@ class Agent:
             # A broadcast focus call from the last round counts as "being attacked" too.
             or (USE_FOCUS_CALLS and self._round - self._focus.get(enemy["unit_id"], -99) <= 1)
         )
-        return (killable, attackable, engaged, TYPE_RANK[enemy["type"]], -self._distance(here, enemy["position"]))
+        if own_type == "archer":
+            strike = (0, best_damage)
+        elif own_type == "cavalry":
+            strike = (enemy["type"] == "archer", best_damage)
+        else:
+            strike = (0, 0)
+        return (killable, attackable, *strike, engaged, TYPE_RANK[enemy["type"]], -self._distance(here, enemy["position"]))
 
     def _select_target(self, observation: SkirmishObservation, paths: list[PathOption], candidates: Iterable[VisibleUnit]) -> VisibleUnit | None:
         candidates = list(candidates)
@@ -1321,6 +1493,15 @@ class Agent:
                 self._tie(option[0]),
             )
 
+        if not stuck and me.unit_type(observation) == "footman" and self._enemies_now:
+            # S4 task 5: with enemies in sight a footman ends its move covered (shield wall or forest,
+            # each -1 arrow damage) whenever that costs at most one extra activation. Against Banner
+            # ours were walled only 44% of the time and took 1.45 per arrow to Banner's 1.23.
+            covered = [option for option in paths if self._footman_covered(observation, option[1])]
+            if covered and min(self._arrival(turns, option[1], goal) for option in covered) <= (
+                min(self._arrival(turns, option[1], goal) for option in paths) + 1
+            ):
+                paths = covered
         best = min(paths, key=key)
         if self._arrival(turns, best[1], goal) >= UNREACHABLE and self._marsh_paths:
             turns = self._route_turns(observation, [goal], marsh_stop=True, allies_passable=stuck)

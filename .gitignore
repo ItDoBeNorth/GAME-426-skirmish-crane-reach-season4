@@ -7,3 +7,6 @@
 # Python caches.
 __pycache__/
 *.py[cod]
+
+# Local benchmark rivals (saved agent copies and the cloned Banner starter); not part of the submission.
+rivals/
