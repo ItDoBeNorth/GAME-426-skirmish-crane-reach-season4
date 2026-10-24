@@ -1,4 +1,4 @@
-# Skirmish at Crane Reach agent
+# Skirmish at Crane Reach(The Commander) agent
 
 Edit `agent.py` to build one unit's behavior for Skirmish at Crane Reach. Every unit on a side runs a separate instance of the same `Agent` class, so they do not share state or variables. `sandbox/` is provided code: do not edit it.
 
