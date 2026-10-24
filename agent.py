@@ -49,6 +49,9 @@ CHARGE_SETUP_DISTANCE = 4
 FORMATION_DEPTH = {"footman": 2, "cavalry": 1, "archer": 0}
 # Footman wall (S4): footmen fill the ring this many tiles around our archer, on the enemy's side.
 WALL_RADIUS = 2
+# River crossing (S4 task 6): a footman engages an enemy across water only if its route reaches a
+# tile next to that enemy within this many activations (the straight line ignores the passages).
+ROUTE_ENGAGE_TURNS = 2
 # Allies farther than this do not block our route planning (the action mask still decides legality).
 ALLY_BLOCK_RADIUS = 2
 # Activations on the same tile, while trying to get somewhere, before we count as stuck.
@@ -140,6 +143,19 @@ class Agent:
                 1 for spot in ring2 if self._cost_grid.get(spot) is not None and spot not in self._marsh
             )
             self._near_cover[key] = key in cover or any(spot in cover for spot in self._neighbor_keys(key))
+        # River passages (S4 task 6): the river is the water seam column down the middle; each run of
+        # passable tiles in it is one crossing (3 with a capture zone; the middle one holds the zone).
+        seam = side // 2
+        self._passages: list[list[Key]] = []
+        run: list[Key] = []
+        for r in range(side):
+            if self._cost_grid.get((seam, r)) is not None:
+                run.append((seam, r))
+            elif run:
+                self._passages.append(run)
+                run = []
+        if run:
+            self._passages.append(run)
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
         self._activation += 1
@@ -606,9 +622,18 @@ class Agent:
             archer = min(ally_archers, key=lambda position: self._distance(here, position))
             if walling:
                 # Footmen stand exactly on their slot, so neighbouring slots make a shield wall.
-                anchor = self._wall_slot(archer, front)
+                # S4 task 6: with the river between our archer and the enemy front, the wall moves to
+                # the crossing (_ford_slot) instead of the bank.
+                if self._passages and self._water_between(archer, front):
+                    anchor = self._ford_slot(archer, front)
+                else:
+                    anchor = self._wall_slot(archer, front)
                 if self._distance(here, anchor) > 0:
                     return self._toward(observation, paths, anchor)
+                if not engageable:
+                    # On our slot with nothing to engage: hold the line. The guard-the-archer step
+                    # below would walk us off the slot, and back again next activation.
+                    return 0
             else:
                 anchor = self._formation_slot(archer, front, FORMATION_DEPTH[own_type])
                 if self._distance(here, anchor) > 1:
@@ -680,6 +705,63 @@ class Agent:
         best = min(
             free,
             key=lambda spot: (self._key_distance(spot, slot), self._key_distance(spot, self._key(front)), self._tie_spot(spot)),
+        )
+        return {"q": best[0], "r": best[1]}
+
+    def _ford_slot(self, archer: AxialPosition, front: AxialPosition) -> Position:
+        """Ford wall (S4 task 6): with the river between our archer and the enemy front, footmen wall
+        the crossing instead of an empty bank: the passage on the shortest way from the archer to
+        the front (almost always the middle ford, which is also the capture zone).
+
+        Slots are the passage tiles first (filling them blocks the crossing), then our bank's tiles
+        touching it. Same fill rules as _wall_slot: keep a passage tile already in line, join a
+        footman already in place, then nearest the front, side-neutral ties. Marsh is skipped.
+        """
+        archer_key, front_key, here = self._key(archer), self._key(front), self._key(self._here)
+
+        def middle(run: list[Key]) -> Key:
+            return run[len(run) // 2]
+
+        passage = min(
+            self._passages,
+            key=lambda run: (
+                self._key_distance(archer_key, middle(run)) + self._key_distance(middle(run), front_key),
+                self._tie_spot(middle(run)),
+            ),
+        )
+        seam = passage[0][0]
+        crossing = [spot for spot in passage if spot not in self._marsh]
+        bank = sorted(
+            {
+                neighbor
+                for spot in passage
+                for neighbor in self._neighbor_keys(spot)
+                if self._cost_grid.get(neighbor) is not None
+                and neighbor not in self._marsh
+                and (neighbor[0] - seam) * (archer_key[0] - seam) > 0
+            }
+        )
+        footmen = {self._key(ally["position"]) for ally in self._allies_now if ally["type"] == "footman"}
+        if here in crossing and any(spot in footmen for spot in self._neighbor_keys(here)):
+            return self._copy(self._here)
+        slots = crossing + bank
+        free = [spot for spot in slots if spot not in self._blocked or spot == here]
+        if not free:
+            return self._wall_slot(archer, front)
+        in_line = {spot for spot in slots if spot in footmen}
+
+        def joins(spot: Key) -> bool:
+            return any(neighbor in in_line for neighbor in self._neighbor_keys(spot))
+
+        best = min(
+            free,
+            key=lambda spot: (
+                spot not in crossing,
+                not joins(spot),
+                self._key_distance(spot, front_key),
+                self._key_distance(spot, here),
+                self._tie_spot(spot),
+            ),
         )
         return {"q": best[0], "r": best[1]}
 
@@ -1026,12 +1108,20 @@ class Agent:
         Enemies across water are left to archers too, unless we have no archers left.
         S4 task 7: cavalry (4 MP) is exempt from the water rule; its routes go around through the
         passages, and attack paths only hold tiles it can reach this turn.
+        S4 task 6: footmen judge "across water" by route, not the straight line: an enemy past the
+        river is engageable when a route through a passage reaches a tile next to it within
+        ROUTE_ENGAGE_TURNS activations (the old rule left every such enemy to the archers).
         """
         if tile.terrain_at(observation, enemy["position"])["terrain"] == "hill":
             return False
         if me.unit_type(observation) == "cavalry":
             return True
-        return not (ally_archers and self._water_between(me.position(observation), enemy["position"]))
+        here = me.position(observation)
+        if not ally_archers or not self._water_between(here, enemy["position"]):
+            return True
+        sides = [spot for spot in tile.neighbors(enemy["position"]).values() if self._cost_grid.get(self._key(spot)) is not None]
+        turns = self._route_turns(observation, sides).get(self._key(here))
+        return turns is not None and turns <= ROUTE_ENGAGE_TURNS
 
     def _ally_archer_positions(self, allies: Iterable[VisibleUnit]) -> list[Position]:
         """Allied archers in sight, else ones remembered (ally memory lasts 2 activations)."""
