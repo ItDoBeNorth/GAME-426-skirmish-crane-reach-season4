@@ -12,7 +12,7 @@ import heapq
 import random
 from typing import Iterable
 
-from sandbox.crane import action, me, paths, tile, units, visible
+from sandbox.crane import action, me, paths, tile, units, visible, zone
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation, VisibleUnit
 
 
@@ -70,6 +70,18 @@ USE_FOCUS_CALLS = False
 SEND_BROADCAST = False
 # How long a relayed "biggest group" report stays usable for merging groups.
 GROUP_MEMORY_ROUNDS = 3
+# Capture zone (S4 tasks 8-10, "fight first, deny the zone"): how many footmen keep the zone (a
+# shield-wall pair), how many activations away a footman will walk for that duty, and how long a
+# chat zone report ("Z") stays usable.
+ZONE_KEEPERS = 2
+ZONE_DUTY_TURNS = 3
+ZONE_REPORT_ROUNDS = 1
+# When the enemy's capture score reaches this share of the target, every footman takes zone duty.
+ZONE_URGENT_SHARE = 0.75
+# Off: zone duty and the "Z" chat relay (S4 tasks 9-10) lost to the task-6 agent on the same seeds
+# (Banner 90% -> 82.5%, s4_t7 58% -> 50%): keepers left the wall that guards our archers. Zone
+# awareness (task 8) still runs. Kept switchable to retune.
+USE_ZONE_LOGIC = False
 
 
 class Agent:
@@ -156,6 +168,16 @@ class Agent:
                 run = []
         if run:
             self._passages.append(run)
+        # Capture zones (S4 task 8): every zone tile (Season 4 has one zone, on the middle ford),
+        # the capture scores seen at our last activation, the freshest chat zone report, and this
+        # activation's zone picture (see _update_zone).
+        found = zone.zones(observation)
+        self._side = own_side
+        self._zone_tiles: set[Key] = {self._key(spot) for area in found for spot in area["tiles"]}
+        self._zone_centers: list[Position] = [self._copy(area["center"]) for area in found]
+        self._capture_seen: dict[str, int] | None = None
+        self._zone_report: dict[str, int] | None = None
+        self._zone: dict = {}
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
         self._activation += 1
@@ -182,6 +204,7 @@ class Agent:
         self._round = observation["observation"]["round"]
         self._here = me.position(observation)
         self._remember(observation, enemies, allies)
+        self._update_zone(observation)
         paths = self._paths(observation)
         if me.unit_type(observation) == "archer":
             order = self._act_archer(observation, paths, enemies, allies)
@@ -230,6 +253,10 @@ class Agent:
             ("S", [self._entry(enemy["unit_id"], enemy["position"], enemy["hit_points"]) for enemy in seen]),
             ("M", [self._entry(me.unit_id(observation), here, me.hit_points(observation))]),
         ]
+        # Zone relay (S4 task 10): "Z <ours>.<theirs>", units of each side on the zone, sent only when
+        # we see the whole zone, so allies out of sight know whether it needs keepers.
+        if USE_ZONE_LOGIC and self._zone.get("sees"):
+            sections.append(("Z", [f"{self._zone['ours']}.{self._zone['theirs']}"]))
         # Group relay: note our own group (us + allies in sight), then pass on the biggest group we
         # know of as "B <q>.<r>.<size>.<round>" so separate groups can find each other and merge.
         members = [here, *(ally["position"] for ally in self._allies_now)]
@@ -314,6 +341,12 @@ class Agent:
                     q, r, size, group_round = (int(part) for part in body.split(".", 3))
                     self._note_group({"q": q, "r": r}, size, group_round)
                     continue
+                if tag == "Z":
+                    ours, theirs = (int(part) for part in body.split(".", 1))
+                    known = self._zone_report
+                    if known is None or known["round"] <= sent_round:
+                        self._zone_report = {"ours": ours, "theirs": theirs, "round": sent_round}
+                    continue
                 for entry in body.split():
                     code, q, r, hit_points = entry.split(".")
                     kind = TYPE_CODES[code[0]]
@@ -374,6 +407,51 @@ class Agent:
             return None
         best = min(alerts, key=lambda alert: (-TYPE_RANK[alert["type"]], self._distance(self._here, alert["position"])))
         return self._copy(best["position"])
+
+    def _update_zone(self, observation: SkirmishObservation) -> None:
+        """S4 task 8: this activation's zone picture in self._zone.
+
+        "ours"/"theirs" count units on zone tiles: from our own sight when we see the whole zone,
+        else from a fresh chat "Z" report (ours stays 0 and theirs falls back to remembered enemies
+        when there is none). The capture score is the one signal that needs no sight: if the enemy's
+        score rose since our last activation, it held the zone uncontested at a round end.
+        """
+        if not self._zone_tiles:
+            self._zone = {}
+            return
+        capture = observation["observation"].get("capture") or {}
+        ours_score = int(capture.get(self._side, 0))
+        theirs_score = int(capture.get(self._enemy_side, 0))
+        last = self._capture_seen
+        enemy_scored = last is not None and theirs_score > last["theirs"]
+        self._capture_seen = {"ours": ours_score, "theirs": theirs_score}
+
+        here = self._here
+        vision = units.STATS[me.unit_type(observation)].vision + (tile.terrain_at(observation, here)["terrain"] == "hill")
+        sees = any(self._distance(here, center) + 1 <= vision for center in self._zone_centers)
+        report = self._zone_report
+        if sees:
+            ours = (self._key(here) in self._zone_tiles) + sum(
+                self._key(ally["position"]) in self._zone_tiles for ally in self._allies_now
+            )
+            theirs = sum(self._key(enemy["position"]) in self._zone_tiles for enemy in self._enemies_now)
+        elif report is not None and self._round - report["round"] <= ZONE_REPORT_ROUNDS:
+            ours, theirs = report["ours"], report["theirs"]
+        else:
+            ours = int(self._key(here) in self._zone_tiles)
+            theirs = sum(
+                self._key(record["position"]) in self._zone_tiles
+                for record in self._recent(self._enemy_memory, 1)
+            )
+        target = int(capture.get("target", 0) or 0)
+        self._zone = {
+            "ours": ours,
+            "theirs": theirs,
+            "sees": sees,
+            "enemy_scoring": enemy_scored or (theirs > 0 and ours == 0),
+            "lead": ours_score - theirs_score,
+            "urgent": target > 0 and theirs_score >= target * ZONE_URGENT_SHARE,
+        }
 
     def _remember(self, observation: SkirmishObservation, enemies: Iterable[VisibleUnit], allies: Iterable[VisibleUnit]) -> None:
         """Refresh what we see, then use sight to correct or drop older records."""
@@ -593,6 +671,11 @@ class Agent:
             hunt = self._cavalry_hunt(observation, paths)
             if hunt is not None:
                 return hunt
+        if own_type == "footman" and USE_ZONE_LOGIC:
+            # S4 task 9: zone duty (below protecting allies and help alerts, above the formation).
+            duty = self._zone_duty(observation, paths, allies)
+            if duty is not None:
+                return duty
 
         group = self._protect_goal(observation, allies)
         front = self._front_point(observation)
@@ -707,6 +790,78 @@ class Agent:
             key=lambda spot: (self._key_distance(spot, slot), self._key_distance(spot, self._key(front)), self._tie_spot(spot)),
         )
         return {"q": best[0], "r": best[1]}
+
+    def _zone_duty(self, observation: SkirmishObservation, paths: list[PathOption], allies: list[VisibleUnit]) -> int | None:
+        """S4 task 9, "fight first, deny the zone": a few footmen keep the zone. None = no duty.
+
+        A footman on a zone tile holds it (stays) while it survives the expected damage there and
+        no more than ZONE_KEEPERS of our footmen are already on it. Otherwise the ZONE_KEEPERS
+        visible footmen nearest the zone go to it when it needs us: the enemy is scoring or nobody
+        of ours is on it. Only if a zone tile is within ZONE_DUTY_TURNS activations and tankable
+        (any tile we survive while the enemy is scoring). Once the enemy nears the capture target
+        ("urgent"), every footman takes the duty. Tiles beside a keeper (shield wall) come first.
+        """
+        status = self._zone
+        if not status:
+            return None
+        here = self._here
+        here_key = self._key(here)
+        hit_points = me.hit_points(observation)
+        footmen_on = [
+            ally for ally in allies if ally["type"] == "footman" and self._key(ally["position"]) in self._zone_tiles
+        ]
+        urgent = status["urgent"]
+        if here_key in self._zone_tiles:
+            if (urgent or len(footmen_on) < ZONE_KEEPERS) and self._incoming(observation, here) < hit_points:
+                return 0
+            return None
+        needed = status["enemy_scoring"] or status["ours"] == 0
+        if not needed and not urgent:
+            return None
+        if not urgent:
+            # Only the ZONE_KEEPERS footmen nearest the zone go (ties by roster index, side-neutral).
+            center = self._zone_centers[0]
+
+            def rank(unit_id: str, position: AxialPosition) -> tuple:
+                return (self._distance(position, center), int(unit_id.split("_")[2]))
+
+            own_rank = rank(me.unit_id(observation), here)
+            closer = sum(
+                rank(ally["unit_id"], ally["position"]) < own_rank
+                for ally in allies
+                if ally["type"] == "footman" and self._key(ally["position"]) not in self._zone_tiles
+            )
+            if closer + len(footmen_on) >= ZONE_KEEPERS:
+                return None
+        survivable = status["enemy_scoring"] or urgent
+        spots = [
+            spot
+            for spot in self._zone_tiles
+            if spot not in self._marsh and spot not in self._blocked and self._cost_grid.get(spot) is not None
+        ]
+        if not spots:
+            return None
+        turns = self._route_turns(observation, [{"q": q, "r": r} for q, r in spots])
+        if turns.get(here_key, UNREACHABLE) > ZONE_DUTY_TURNS:
+            return None
+        keepers = {self._key(ally["position"]) for ally in footmen_on}
+
+        def acceptable(spot: Key) -> bool:
+            damage = self._incoming(observation, {"q": spot[0], "r": spot[1]})
+            return damage < hit_points if survivable else self._can_tank(observation, {"q": spot[0], "r": spot[1]})
+
+        options = [spot for spot in spots if acceptable(spot)]
+        if not options:
+            return None
+        goal = min(
+            options,
+            key=lambda spot: (
+                not any(neighbor in keepers for neighbor in self._neighbor_keys(spot)),
+                self._key_distance(spot, here_key),
+                self._tie_spot(spot),
+            ),
+        )
+        return self._toward(observation, paths, {"q": goal[0], "r": goal[1]})
 
     def _ford_slot(self, archer: AxialPosition, front: AxialPosition) -> Position:
         """Ford wall (S4 task 6): with the river between our archer and the enemy front, footmen wall
