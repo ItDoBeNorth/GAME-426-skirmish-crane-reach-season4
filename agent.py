@@ -1,9 +1,14 @@
-"""A role-based Season 1 agent for Skirmish at Crane Reach.
+"""A role-based Season 4 ("The Commander") agent for Skirmish at Crane Reach.
 
 Each unit runs a separate instance of this class. Read ``environment.md`` beside this file for
 the rules, helpers, and later-season mechanics. Prepare episode state in ``reset``; the
 constructor takes no arguments. Movement always comes from the action mask: this agent scores
 complete legal paths rather than recreating movement rules.
+
+Roles (built up from Season 1): footmen form a shield wall in front of our archers (on the river
+ford when the river separates the armies), cavalry hunt enemy archers with charges and
+hit-and-run, archers kite and pick the target their arrows hurt most. Zone duty and the forecast
+judge (Season 4 tasks 8-12) are implemented but switched off; see USE_ZONE_LOGIC and FORECAST_*.
 """
 
 from __future__ import annotations
@@ -97,6 +102,11 @@ FORECAST_ZONE_CANDIDATE = False
 # Off: it lost to the task-6 rules on the same seeds (Banner 85% vs 90%, s4_t6 45%). A forecast
 # from one unit's view (plus short memory) and guessed orders knows less than the tuned rules.
 FORECAST_CAVALRY = False
+# S4 task 13 fixes, switched off: each alone scored 33/40 against Banner on the task-6 seeds (task 6:
+# 36/40). WATER_AWARE_SAFETY: _safe_memory_paths uses travel-aware reach instead of straight
+# distance. ALERT_DONE_ON_ARRIVAL: a unit that reaches a help call with nothing to fight moves on.
+WATER_AWARE_SAFETY = False
+ALERT_DONE_ON_ARRIVAL = False
 FORECAST_ROUNDS = 3
 FORECAST_CAPTURE_WEIGHT = 0.5
 # A judged choice is kept this many rounds while it is still on offer (saves time, no dithering).
@@ -118,7 +128,7 @@ PATH_OFFSETS: list[tuple[int, int]] = [
 
 
 class Agent:
-    """Use archer kiting and local melee support to contest the center."""
+    """One unit: archers kite, footmen wall, cavalry hunt; the army fights first, the zone second."""
 
     def reset(self, seed, observation) -> None:
         # Called once before each match. The opening observation is available here for
@@ -703,8 +713,15 @@ class Agent:
         if alert is not None:
             # An ally out of our sight reported "enemy attacking me" by chat: go help.
             path = self._toward(observation, paths, alert)
-            if path != 0 or self._distance(here, alert) <= 1:
+            if path != 0 or (not ALERT_DONE_ON_ARRIVAL and self._distance(here, alert) <= 1):
                 return path
+            if self._distance(here, alert) <= 1:
+                # S4 task 13: arrived and nothing to fight here (strikes were handled before
+                # _melee_move): the alert is answered, so drop it and fall through instead of idling.
+                # Switched off (ALERT_DONE_ON_ARRIVAL): no gain against Banner on the same seeds.
+                self._ally_alerts = {
+                    unit_id: record for unit_id, record in self._ally_alerts.items() if record["position"] != alert
+                }
         if own_type == "cavalry":
             # S4 task 7: cavalry is the offense: with no strike this turn it hunts enemy archers
             # (staging for a charge) before taking its reserve slot behind the wall.
@@ -718,7 +735,10 @@ class Agent:
                 judged = self._judge_footman(observation, paths, enemies, allies, engageable, ally_archers)
                 if judged is not None:
                     return judged
-            elif USE_ZONE_LOGIC:
+            elif USE_ZONE_LOGIC or self._zone.get("urgent"):
+                # S4 task 13: stalemate safety net: even with zone logic off, once the enemy's
+                # capture score nears the target (ZONE_URGENT_SHARE) every footman contests the zone.
+                # Games against our rivals end in ~30 rounds, so this only acts in long stalemates.
                 duty = self._zone_duty(observation, paths, allies)
                 if duty is not None:
                     return duty
@@ -1915,8 +1935,21 @@ class Agent:
         return self._safe_memory_paths(paths, [(threat["type"], threat["position"]) for threat in threats])
 
     def _safe_memory_paths(self, paths: Iterable[PathOption], threats: Iterable[tuple[str, Position]]) -> list[PathOption]:
-        threats = list(threats)
-        return [path for path in paths if all(self._distance(path[1], position) > self._threat_range(kind) for kind, position in threats)]
+        """Path ends none of these threats can strike next activation.
+
+        S4 task 13: travel-aware via _strike_from (water and blocked tiles count), not the straight
+        distance against _threat_range, which made units flee melee that could not cross the river.
+        Switched off (WATER_AWARE_SAFETY): no gain against Banner on the same seeds.
+        """
+        if not WATER_AWARE_SAFETY:
+            threats = list(threats)
+            return [path for path in paths if all(self._distance(path[1], position) > self._threat_range(kind) for kind, position in threats)]
+        threats = [(kind, self._key(position)) for kind, position in threats]
+        return [
+            path
+            for path in paths
+            if not any(self._strike_from(kind, source, self._key(path[1]))[0] for kind, source in threats)
+        ]
 
     def _archer_threats(
         self, observation: SkirmishObservation, enemies: Iterable[VisibleUnit]
