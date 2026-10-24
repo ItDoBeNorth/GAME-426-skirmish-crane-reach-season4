@@ -42,3 +42,11 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+
+
+## Reflection
+Season 4: I revised footman and cavalry feedback and roles according to wall and charge, changed a little bit of terrain rules for water and zones, archer targeting and formation order, attacks across water, zone awareness and strategy. Also a bit of forecast, memory, communication, and lookahead to get a clearer strategy.
+
+## AI Use Disclosure and Reflection
+I used Claude Code in VS Code. It coded all of this based on my pseudocode and instructions. I verified each set of code it wrote before approving it, reverted and asked for changes as needed, tested by watching and eval, and discussed my ideas for solutions before committing to one. I did not write any code directly, but read summaries to check it. I had it set to ask for approval before committing anything, and that worked especially during testing and understanding what code was being changed. The most successful part was that we made and followed a plan based on what I wanted, and slowly went through it while changing code and testing. However, Claude has started to run more complicated commands I don't understand in order to read my older code and test. It might get too fast for me to understand whats going on most of the time. The code has gotten quite complicated as well. 
+
