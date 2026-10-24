@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import heapq
 import random
+import time
 from typing import Iterable
 
-from sandbox.crane import action, me, paths, tile, units, visible, zone
+from sandbox.crane import action, forecast, me, paths, tile, units, visible, zone
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation, VisibleUnit
 
 
@@ -78,10 +79,42 @@ ZONE_DUTY_TURNS = 3
 ZONE_REPORT_ROUNDS = 1
 # When the enemy's capture score reaches this share of the target, every footman takes zone duty.
 ZONE_URGENT_SHARE = 0.75
-# Off: zone duty and the "Z" chat relay (S4 tasks 9-10) lost to the task-6 agent on the same seeds
-# (Banner 90% -> 82.5%, s4_t7 58% -> 50%): keepers left the wall that guards our archers. Zone
-# awareness (task 8) still runs. Kept switchable to retune.
+# Zone duty and the "Z" chat relay (S4 tasks 9-10). As a fixed rule they lost to the task-6 agent on
+# the same seeds (Banner 90% -> 82.5%, s4_t7 58% -> 50%): keepers left the wall that guards our
+# archers. With zone duty as a forecast-judge option (task 12) it also lost to task 6 (Banner 85%,
+# s4_t6 45%): the zone rarely decides a game that ends by elimination in ~30 rounds.
 USE_ZONE_LOGIC = False
+# Forecast judge (S4 task 12, the course's search-based planning): a footman compares candidate
+# moves (hold its slot, advance on a target, and go to the zone if FORECAST_ZONE_CANDIDATE) by
+# forecasting FORECAST_ROUNDS of its own activations and scoring
+# (our HP - enemy HP) + FORECAST_CAPTURE_WEIGHT * capture lead. Off = the rules decide alone.
+# Off: without the zone candidate the footman judge never fires (an enemy it could advance on is
+# already attacked, or threatens an ally, before the judge runs), so it only cost time.
+USE_FORECAST_JUDGE = False
+FORECAST_ZONE_CANDIDATE = False
+# Cavalry forecast judge (S4 task 12b): past the sure cases (kill this turn, protecting an ally),
+# cavalry picks attack / set up a charge / flee by forecast instead of the damage-estimate rules.
+# Off: it lost to the task-6 rules on the same seeds (Banner 85% vs 90%, s4_t6 45%). A forecast
+# from one unit's view (plus short memory) and guessed orders knows less than the tuned rules.
+FORECAST_CAVALRY = False
+FORECAST_ROUNDS = 3
+FORECAST_CAPTURE_WEIGHT = 0.5
+# A judged choice is kept this many rounds while it is still on offer (saves time, no dithering).
+FORECAST_COMMIT_ROUNDS = 2
+# Time guard: no forecasting once this activation has used this much, or this game this much.
+FORECAST_ACT_BUDGET_MS = 300
+FORECAST_GAME_BUDGET_MS = 60_000
+# Enemy prediction inside the forecast: enemies advance on our nearest unit they can see and strike
+# (archers stop once in range), like Banner's advance. Off = every other unit stays put.
+FORECAST_PREDICT_ENEMIES = True
+# End offset (dq, dr) of every path id, computed once at import for the enemy prediction.
+PATH_OFFSETS: list[tuple[int, int]] = [
+    (
+        sum(HEX_OFFSETS[digit - 1][0] for digit in paths.decode(path_id)),
+        sum(HEX_OFFSETS[digit - 1][1] for digit in paths.decode(path_id)),
+    )
+    for path_id in range(paths.MAX_ID + 1)
+]
 
 
 class Agent:
@@ -178,8 +211,15 @@ class Agent:
         self._capture_seen: dict[str, int] | None = None
         self._zone_report: dict[str, int] | None = None
         self._zone: dict = {}
+        # Forecast judge (S4 task 12): time spent this game, the committed choice, and a re-entry
+        # guard (the judge asks _melee_move for the "hold" move).
+        self._forecast_ms = 0.0
+        self._judged: dict | None = None
+        self._judging = False
+        self._act_started = time.perf_counter()
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
+        self._act_started = time.perf_counter()
         self._activation += 1
         enemies = visible.enemies(observation)
         allies = visible.allies(observation)
@@ -671,11 +711,17 @@ class Agent:
             hunt = self._cavalry_hunt(observation, paths)
             if hunt is not None:
                 return hunt
-        if own_type == "footman" and USE_ZONE_LOGIC:
+        if own_type == "footman" and not self._judging:
             # S4 task 9: zone duty (below protecting allies and help alerts, above the formation).
-            duty = self._zone_duty(observation, paths, allies)
-            if duty is not None:
-                return duty
+            # S4 task 12: the forecast judge decides instead of the fixed rule when switched on.
+            if USE_FORECAST_JUDGE:
+                judged = self._judge_footman(observation, paths, enemies, allies, engageable, ally_archers)
+                if judged is not None:
+                    return judged
+            elif USE_ZONE_LOGIC:
+                duty = self._zone_duty(observation, paths, allies)
+                if duty is not None:
+                    return duty
 
         group = self._protect_goal(observation, allies)
         front = self._front_point(observation)
@@ -791,7 +837,150 @@ class Agent:
         )
         return {"q": best[0], "r": best[1]}
 
-    def _zone_duty(self, observation: SkirmishObservation, paths: list[PathOption], allies: list[VisibleUnit]) -> int | None:
+    def _judge_footman(
+        self,
+        observation: SkirmishObservation,
+        paths: list[PathOption],
+        enemies: list[VisibleUnit],
+        allies: list[VisibleUnit],
+        engageable: list[VisibleUnit],
+        ally_archers: list[Position],
+    ) -> int | None:
+        """S4 task 12: forecast judge for a footman's move (course: search-based planning).
+
+        Candidates: "hold" (what _melee_move does without zone duty: wall/ford slot, advance with
+        the group, guard), "zone" (_zone_duty forced, only with FORECAST_ZONE_CANDIDATE) and "advance" (toward the best engageable
+        target). Each is forecast (_forecast_value) and the best score wins; ties keep the earlier
+        candidate, so "hold" wins ties. A choice is kept FORECAST_COMMIT_ROUNDS while still on
+        offer. None (fall back to the rules) on any forecast error or when over the time budget.
+        """
+        if self._forecast_ms > FORECAST_GAME_BUDGET_MS or (time.perf_counter() - self._act_started) * 1000 > FORECAST_ACT_BUDGET_MS:
+            return None
+        self._judging = True
+        try:
+            hold = self._melee_move(observation, paths, enemies, allies, engageable, ally_archers)
+        finally:
+            self._judging = False
+        candidates = {"hold": hold}
+        zone_path = self._zone_duty(observation, paths, allies, forced=True) if FORECAST_ZONE_CANDIDATE else None
+        if zone_path is not None:
+            candidates["zone"] = zone_path
+        target = self._select_target(observation, paths, engageable)
+        if target is not None:
+            candidates["advance"] = self._toward(observation, paths, target["position"])
+        if len(set(candidates.values())) < 2:
+            return hold
+        committed = self._judged
+        if committed is not None and self._round - committed["round"] < FORECAST_COMMIT_ROUNDS and committed["choice"] in candidates:
+            return candidates[committed["choice"]]
+        started = time.perf_counter()
+        try:
+            trial_observation = self._forecast_observation(observation)
+            best_name, best_value, tried = None, None, set()
+            for name, path in candidates.items():
+                if path in tried:
+                    continue
+                tried.add(path)
+                value = self._forecast_value(trial_observation, path)
+                if best_value is None or value > best_value:
+                    best_name, best_value = name, value
+        except Exception:  # noqa: BLE001 - a forecast must never cost us the activation
+            return hold
+        finally:
+            self._forecast_ms += (time.perf_counter() - started) * 1000
+        self._judged = {"choice": best_name, "round": self._round}
+        return candidates[best_name]
+
+    def _forecast_observation(self, observation: SkirmishObservation) -> SkirmishObservation:
+        """S4 task 12: the observation plus enemies we remember from this round or the last (sight
+        or chat), so a footman's forecast (vision 4) also holds the archers shooting at it. A copy:
+        the real observation is untouched."""
+        state = observation["observation"]
+        taken = {self._key(unit["position"]) for unit in state["visible_units"]} | {self._key(state["self"]["position"])}
+        seen_ids = {unit["unit_id"] for unit in state["visible_units"]}
+        ghosts = []
+        for unit_id, record in self._enemy_memory.items():
+            key = self._key(record["position"])
+            if unit_id in seen_ids or unit_id in self._known_dead or key in taken or self._round - record["round"] > 1:
+                continue
+            taken.add(key)
+            ghosts.append(
+                {
+                    "unit_id": unit_id,
+                    "side": self._enemy_side,
+                    "type": record["type"],
+                    "position": self._copy(record["position"]),
+                    "hit_points": record["hit_points"],
+                    "has_acted": False,
+                }
+            )
+        copied = dict(state)
+        copied["visible_units"] = [*state["visible_units"], *ghosts]
+        return {**observation, "observation": copied}
+
+    def _forecast_value(
+        self, observation: SkirmishObservation, path: int, target_id: str | None = None, own_advances: bool = False
+    ) -> float:
+        """S4 task 12: play `path` now (naming `target_id` if given), then FORECAST_ROUNDS - 1 more
+        of our activations: stay, or with `own_advances` (cavalry, task 12b) advance on the nearest
+        enemy like the enemy prediction. Allies stay (each still strikes whatever is in range);
+        enemies follow _predict_advance when FORECAST_PREDICT_ENEMIES is on, else stay too. Score
+        the ending: (our HP - enemy HP) + FORECAST_CAPTURE_WEIGHT * (our capture lead)."""
+        trial = forecast.from_observation(observation)
+        own_player = trial.agent_selection
+        trial.step(action.move(path, target_id, observation) if target_id else (action.move(path) if path else action.stay()))
+        turns = 1
+        while trial.agents:
+            simulated, _, terminated, truncated, _ = trial.last()
+            if trial.agent_selection == own_player:
+                if terminated or truncated or turns >= FORECAST_ROUNDS:
+                    break
+                turns += 1
+                order = self._predict_advance(simulated, self._enemy_side) if own_advances else action.stay()
+            elif terminated or truncated:
+                order = None
+            elif FORECAST_PREDICT_ENEMIES and simulated["observation"]["self"]["unit_id"].startswith(self._enemy_side):
+                order = self._predict_advance(simulated, self._side)
+            else:
+                order = action.stay()
+            trial.step(order)
+        ending = trial.match
+        ours = sum(unit.hit_points for unit in ending.units.values() if unit.side == self._side)
+        theirs = sum(unit.hit_points for unit in ending.units.values() if unit.side == self._enemy_side)
+        lead = ending.capture_scores[self._side] - ending.capture_scores[self._enemy_side]
+        return ours - theirs + FORECAST_CAPTURE_WEIGHT * lead
+
+    def _predict_advance(self, simulated: SkirmishObservation, foe_side: str) -> SkirmishAction:
+        """S4 task 12: a forecast unit's order, a cheap stand-in for Banner's advance (used for the
+        enemies, and for our own cavalry's later turns). It walks the legal path that brings it
+        nearest to striking range of the nearest `foe_side` unit it can see (archers prefer the
+        farthest end still in range, melee the nearest); it stays if already in range or if it sees
+        no foe. The engine resolves its strike (and any charge) automatically."""
+        state = simulated["observation"]
+        own = state["self"]
+        here = self._key(own["position"])
+        targets = [self._key(unit["position"]) for unit in state["visible_units"] if unit["side"] == foe_side]
+        if not targets:
+            return action.stay()
+        reach = units.STATS[own["type"]].attack_range
+        if min(self._key_distance(here, spot) for spot in targets) <= reach:
+            return action.stay()
+        archer = own["type"] == "archer"
+        best, best_key = 0, None
+        for path_id, allowed in enumerate(simulated["action_mask"]["path"]):
+            if not allowed:
+                continue
+            dq, dr = PATH_OFFSETS[path_id]
+            end = (here[0] + dq, here[1] + dr)
+            nearest = min(self._key_distance(end, spot) for spot in targets)
+            key = (max(nearest - reach, 0), -nearest if archer else nearest)
+            if best_key is None or key < best_key:
+                best, best_key = path_id, key
+        return action.move(best) if best else action.stay()
+
+    def _zone_duty(
+        self, observation: SkirmishObservation, paths: list[PathOption], allies: list[VisibleUnit], forced: bool = False
+    ) -> int | None:
         """S4 task 9, "fight first, deny the zone": a few footmen keep the zone. None = no duty.
 
         A footman on a zone tile holds it (stays) while it survives the expected damage there and
@@ -800,6 +989,10 @@ class Agent:
         of ours is on it. Only if a zone tile is within ZONE_DUTY_TURNS activations and tankable
         (any tile we survive while the enemy is scoring). Once the enemy nears the capture target
         ("urgent"), every footman takes the duty. Tiles beside a keeper (shield wall) come first.
+
+        forced (S4 task 12): the forecast judge's "zone" candidate. It skips the "is it needed" and
+        "am I among the nearest" checks and accepts any tile we survive; the forecast weighs the
+        risk. Still None when ZONE_KEEPERS footmen already keep the zone or it is out of reach.
         """
         status = self._zone
         if not status:
@@ -815,10 +1008,12 @@ class Agent:
             if (urgent or len(footmen_on) < ZONE_KEEPERS) and self._incoming(observation, here) < hit_points:
                 return 0
             return None
-        needed = status["enemy_scoring"] or status["ours"] == 0
-        if not needed and not urgent:
+        if forced and not urgent and len(footmen_on) >= ZONE_KEEPERS:
             return None
-        if not urgent:
+        needed = status["enemy_scoring"] or status["ours"] == 0
+        if not needed and not urgent and not forced:
+            return None
+        if not urgent and not forced:
             # Only the ZONE_KEEPERS footmen nearest the zone go (ties by roster index, side-neutral).
             center = self._zone_centers[0]
 
@@ -833,7 +1028,7 @@ class Agent:
             )
             if closer + len(footmen_on) >= ZONE_KEEPERS:
                 return None
-        survivable = status["enemy_scoring"] or urgent
+        survivable = status["enemy_scoring"] or urgent or forced
         spots = [
             spot
             for spot in self._zone_tiles
@@ -1024,6 +1219,11 @@ class Agent:
         attack = self._order(best[0], target["unit_id"], observation)
         if self._can_kill_this_turn(observation, paths, target) or self._protecting(target, TYPE_RANK):
             return attack
+        if FORECAST_CAVALRY:
+            # S4 task 12b: past the sure cases, a forecast picks attack / set up a charge / flee.
+            judged = self._judge_cavalry(observation, paths, best, target, enemies)
+            if judged is not None:
+                return judged
         here = me.position(observation)
         target_key = self._key(target["position"])
         first_hit = self._expected_damage(observation, "cavalry", best[1], target, start=here)
@@ -1056,6 +1256,59 @@ class Agent:
         if self._incoming(observation, flee_end) < incoming:
             return self._order(flee_path, None, observation)
         return attack
+
+    def _judge_cavalry(
+        self,
+        observation: SkirmishObservation,
+        paths: list[PathOption],
+        best: PathOption,
+        target: VisibleUnit,
+        enemies: list[VisibleUnit],
+    ) -> SkirmishAction | None:
+        """S4 task 12b: forecast judge for cavalry once no kill or protection forces the attack.
+
+        Candidates, in tie order (offense first): "attack" (best attack path on the target),
+        "setup" (the safest tile CHARGE_SETUP_DISTANCE from the target, as in _cavalry_choice) and
+        "flee" (_flee). Each is forecast with our later activations advancing on the nearest enemy
+        (so a set-up charge actually lands) and enemies advancing on us. None (use the rules) when
+        over the time budget or on any forecast error.
+        """
+        if self._forecast_ms > FORECAST_GAME_BUDGET_MS or (time.perf_counter() - self._act_started) * 1000 > FORECAST_ACT_BUDGET_MS:
+            return None
+        candidates: list[tuple[str, int, str | None]] = [("attack", best[0], target["unit_id"])]
+        setup = [
+            option
+            for option in paths
+            if CHARGE_SETUP_DISTANCE <= self._distance(option[1], target["position"]) <= CHARGE_SETUP_DISTANCE + 1
+        ]
+        if setup:
+            retreat = min(
+                setup,
+                key=lambda option: (
+                    self._incoming(observation, option[1]),
+                    -self._terrain_preference(observation, option[1]),
+                    self._tie(option[0]),
+                ),
+            )
+            candidates.append(("setup", retreat[0], None))
+        threats = [(enemy["type"], enemy["position"]) for enemy in enemies]
+        candidates.append(("flee", self._flee(observation, paths, threats), None))
+        started = time.perf_counter()
+        try:
+            trial_observation = self._forecast_observation(observation)
+            chosen, best_value, tried = None, None, set()
+            for _name, path, target_id in candidates:
+                if path in tried:
+                    continue
+                tried.add(path)
+                value = self._forecast_value(trial_observation, path, target_id=target_id, own_advances=True)
+                if best_value is None or value > best_value:
+                    chosen, best_value = (path, target_id), value
+        except Exception:  # noqa: BLE001 - a forecast must never cost us the activation
+            return None
+        finally:
+            self._forecast_ms += (time.perf_counter() - started) * 1000
+        return self._order(chosen[0], chosen[1], observation)
 
     def _cavalry_hunt(self, observation: SkirmishObservation, paths: list[PathOption]) -> int | None:
         """S4 task 7: with no strike this turn, ride toward the nearest known enemy archer (seen, or
